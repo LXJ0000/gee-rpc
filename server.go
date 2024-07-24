@@ -1,4 +1,4 @@
-package server
+package geerpc
 
 import (
 	"encoding/json"
@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/LXJ0000/gee-rpc/codec"
 )
@@ -18,13 +19,16 @@ import (
 const MagicNumber = 0x3bef5c
 
 type Option struct {
-	MagicNumber int
-	CodecType   codec.Type
+	MagicNumber    int
+	CodecType      codec.Type
+	ConnectTimeout time.Duration // 0 means not limit
+	HandleTimeout  time.Duration
 }
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 type Server struct {
@@ -100,12 +104,12 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		return
 	}
 	cc := f(conn)
-	s.serveCodec(cc)
+	s.serveCodec(cc, &opt)
 }
 
 var invalidRequest = struct{}{}
 
-func (s *Server) serveCodec(cc codec.Codec) {
+func (s *Server) serveCodec(cc codec.Codec, opt *Option) {
 	defer func() {
 		_ = cc.Close()
 	}()
@@ -122,7 +126,7 @@ func (s *Server) serveCodec(cc codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go s.handleRequest(cc, req, sending, wg)
+		go s.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 }
@@ -176,14 +180,33 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 	}
 }
 
-func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	if err := req.svc.call(req.mtype, req.argv, req.replyv); err != nil {
-		req.h.Error = err.Error()
-		s.sendResponse(cc, req.h, invalidRequest, sending)
+	called, sented := make(chan struct{}), make(chan struct{})
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			s.sendResponse(cc, req.h, invalidRequest, sending)
+			sented <- struct{}{}
+			return
+		}
+		s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		sented <- struct{}{}
+	}()
+	if timeout == 0 {
+		<-called
+		<-sented
 		return
 	}
-	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	select {
+	case <-time.After(timeout):
+		req.h.Error = "rpc server: request handle timeout: expected within " + timeout.String()
+		s.sendResponse(cc, req.h, invalidRequest, sending)
+	case <-called:
+		<-sented
+	}
 }
 
 func Accept(lis net.Listener) {
